@@ -1,10 +1,15 @@
 """
-parser.py — преобразует сырой JSON-элемент из API 2ГИС в ParkingRecord.
+parser.py — маппинг сырого JSON-элемента 2ГИС → ParkingRecord.
 
-Поддерживает три формата ответа:
-  "items"     — /3.0/items?rubric_id=60340  (самый богатый: адрес, capacity, etc.)
+Поддерживаемые форматы:
+  "items"     — /3.0/items?rubric_id=60340  (богатый: адрес, capacity, attribute_groups)
   "byid"      — /3.0/items/byid             (те же поля, что items)
-  "clustered" — /3.0/markers/clustered      (только координаты, имя, тариф, рейтинг)
+  "clustered" — /3.0/markers/clustered      (координаты, имя, тариф из context, рейтинг)
+
+Честная граница возможностей:
+  - price_per_hour и type — эвристики; могут быть None / "неизвестно" — это ожидаемо.
+  - capacity, has_disabled_parking, has_ev_charging — только в items/byid.
+  - address — только в items/byid; в clustered всегда None.
 """
 
 import re
@@ -12,27 +17,35 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from models import ParkingRecord, Tristate
+from utils import (
+    build_address,
+    format_schedule,
+    get_attribute_by_tag,
+    parse_price_from_text,
+)
 
 # ── Публичный API ──────────────────────────────────────────────────────────────
 
 def parse_parking_item(raw: dict, *, source: str = "items") -> ParkingRecord:
     """
-    Единственная точка входа для парсинга.
+    Единственная точка входа.
 
     raw    — один элемент из response.result.items[]
     source — "items" | "byid" | "clustered"
     """
     id_2gis = _clean_id(raw.get("id", ""))
     lat, lon = _extract_coords(raw, source=source)
-
     tariff = _extract_tariff(raw, source=source)
+
+    # price_per_hour — эвристика; None ожидаем, если тариф не распарсился
     parking_type, target_object = _extract_type_and_target(raw)
+    # type — эвристика по названию; "неизвестно" — штатный результат
 
     return ParkingRecord(
         id_2gis=id_2gis,
-        name=raw.get("name") or raw.get("name_ex", {}).get("primary") or "",
+        name=_extract_name(raw),
         url=_build_url(id_2gis),
-        address=_extract_address(raw, source=source),
+        address=build_address(raw) if source != "clustered" else None,
         latitude=lat,
         longitude=lon,
         district=_extract_district(raw),
@@ -42,7 +55,7 @@ def parse_parking_item(raw: dict, *, source: str = "items") -> ParkingRecord:
         price_per_hour=tariff["price_per_hour"],
         raw_tariff=tariff["raw_tariff"],
         capacity=_extract_capacity(raw),
-        working_hours=_extract_working_hours(raw),
+        working_hours=format_schedule(raw.get("schedule")),
         for_trucks=_extract_for_trucks(raw),
         paving_type=raw.get("paving_type"),
         has_disabled_parking=_extract_disabled_parking(raw),
@@ -57,21 +70,28 @@ def parse_parking_item(raw: dict, *, source: str = "items") -> ParkingRecord:
 
 def _clean_id(raw_id: str) -> str:
     """
-    В clustered-формате id выглядит как "70000001054874402_f4x4qe7DdBdB...".
-    Числовая часть до первого "_" — это настоящий id объекта в 2ГИС.
-    В items/byid id уже чистый: "70000001076150305".
+    В clustered id выглядит как "70000001054874402_f4x4qe7...".
+    Числовая часть до "_" — настоящий id объекта 2ГИС.
+    В items/byid id уже чистый.
     """
     return raw_id.split("_")[0] if "_" in raw_id else raw_id
 
 
 def _build_url(id_2gis: str) -> str:
-    """Каноническая ссылка на объект в 2ГИС Алматы."""
-    return f"https://2gis.kz/almaty/parking/{id_2gis}"
+    """
+    /firm/ — универсальный маршрут 2ГИС для любого объекта.
+    /parking/ переадресует, но /firm/ надёжнее.
+    """
+    return f"https://2gis.kz/almaty/firm/{id_2gis}"
+
+
+def _extract_name(raw: dict) -> str:
+    return raw.get("name") or (raw.get("name_ex") or {}).get("primary") or ""
 
 
 def _extract_coords(raw: dict, *, source: str) -> tuple[float, float]:
     """
-    clustered → lat/lon на верхнем уровне.
+    clustered → lat/lon на верхнем уровне объекта.
     items/byid → вложены в point: {"lat": ..., "lon": ...}.
     """
     if source == "clustered":
@@ -80,21 +100,8 @@ def _extract_coords(raw: dict, *, source: str) -> tuple[float, float]:
     return float(point.get("lat", 0.0)), float(point.get("lon", 0.0))
 
 
-def _extract_address(raw: dict, *, source: str) -> Optional[str]:
-    """
-    clustered не содержит адреса вообще — возвращаем None.
-    items/byid хранят готовую строку в address_name.
-    """
-    if source == "clustered":
-        return None
-    return raw.get("address_name")
-
-
 def _extract_district(raw: dict) -> Optional[str]:
-    """
-    Район берём из adm_div[] с type == "district".
-    Присутствует только в items/byid; в clustered — отсутствует.
-    """
+    """Район из adm_div[type == "district"]. Только items/byid."""
     for div in raw.get("adm_div") or []:
         if div.get("type") == "district":
             return div.get("name")
@@ -103,112 +110,80 @@ def _extract_district(raw: dict) -> Optional[str]:
 
 def _extract_tariff(raw: dict, *, source: str) -> dict:
     """
-    Два источника тарифа, в зависимости от формата:
+    Источники тарифа по убыванию надёжности:
 
-    clustered/items — context.stop_factors[] с тегами:
-        parking_cost_parking_hour  → цена за час
-        parking_cost_parking_day   → цена за сутки (в raw_tariff)
-        parking_free_parking       → признак бесплатной парковки
+    1. attribute_groups, тег parking_price_comment — готовый текст тарифа (items/byid)
+    2. context.stop_factors — теги parking_cost_parking_hour / parking_cost_parking_day
+       (есть и в clustered, и в items)
+    3. raw["is_paid"] — прямой bool-флаг (только items/byid)
 
-    items/byid — поле is_paid (bool) как прямой ответ API.
-    Stop_factors приоритетнее, потому что несут числовые значения.
+    price_per_hour — эвристика: None ожидаем если тарифа нет или он не числовой.
     """
-    result = {"is_paid": None, "price_per_hour": None, "raw_tariff": None}
+    result: dict = {"is_paid": None, "price_per_hour": None, "raw_tariff": None}
 
-    # Прямой флаг из items/byid
-    if source in ("items", "byid") and "is_paid" in raw:
-        result["is_paid"] = bool(raw["is_paid"])
+    # 1. Готовый текст тарифа из attribute_groups
+    tariff_comment = get_attribute_by_tag(raw, "parking_price_comment")
 
+    # 2. stop_factors — работают для обоих форматов
     stop_factors = (raw.get("context") or {}).get("stop_factors") or []
-    tariff_parts: list[str] = []
+    sf_parts: list[str] = []
 
     for sf in stop_factors:
         tag = sf.get("tag", "")
-        name = sf.get("name", "").replace("\xa0", " ").strip()
+        name = (sf.get("name") or "").replace("\xa0", " ").strip()
 
         if tag == "parking_cost_parking_hour":
-            tariff_parts.append(name)
+            sf_parts.append(name)
             result["is_paid"] = True
-            # Извлекаем число: "400 тнг./час" → 400.0
-            m = re.search(r"(\d[\d\s]*)", name)
-            if m:
-                result["price_per_hour"] = float(m.group(1).replace(" ", ""))
+            # price_per_hour — эвристика; None если число не найдено
+            result["price_per_hour"] = parse_price_from_text(name)
 
         elif tag == "parking_cost_parking_day":
-            tariff_parts.append(name)
-            # Не перезаписываем is_paid: суточная цена ≠ бесплатно
+            sf_parts.append(name)
 
         elif tag == "parking_free_parking":
-            tariff_parts.append(name)
-            # Бесплатный период не означает полностью бесплатную парковку,
-            # но если hour-тарифа нет — считаем бесплатной.
+            sf_parts.append(name)
+            # Бесплатный период ≠ полностью бесплатная парковка,
+            # но если hour-цены нет — считаем бесплатной
             if result["is_paid"] is None:
                 result["is_paid"] = False
 
-    if tariff_parts:
-        result["raw_tariff"] = " | ".join(tariff_parts)
+    # raw_tariff: приоритет у явного комментария из attribute_groups
+    if tariff_comment:
+        result["raw_tariff"] = tariff_comment
+    elif sf_parts:
+        result["raw_tariff"] = " | ".join(sf_parts)
+
+    # 3. Прямой флаг из items/byid (не перезаписываем если уже определили)
+    if result["is_paid"] is None and source in ("items", "byid"):
+        is_paid_raw = raw.get("is_paid")
+        if is_paid_raw is not None:
+            result["is_paid"] = bool(is_paid_raw)
 
     return result
 
 
 def _extract_capacity(raw: dict) -> Optional[int]:
     """
-    Поле capacity присутствует только в items/byid.
-    Может прийти как int или строка — приводим к int.
+    capacity в items/byid может быть:
+      - int (старый формат)
+      - {"total": N, "special_spaces": [...]} (новый формат)
+    В clustered отсутствует.
     """
     val = raw.get("capacity")
     if val is None:
         return None
+    if isinstance(val, dict):
+        total = val.get("total")
+        return int(total) if total is not None else None
     try:
         return int(val)
     except (ValueError, TypeError):
         return None
 
 
-def _extract_working_hours(raw: dict) -> Optional[str]:
-    """
-    schedule — словарь вида {"Mon": {"working_hours": [{"from": "10:00", "to": "24:00"}]}, ...}.
-    Если все дни одинаковые — сворачиваем в "Пн-Вс: 10:00–24:00".
-    Иначе — перечисляем уникальные интервалы.
-    """
-    schedule = raw.get("schedule")
-    if not schedule:
-        return None
-
-    day_map = {"Mon": "Пн", "Tue": "Вт", "Wed": "Ср", "Thu": "Чт",
-               "Fri": "Пт", "Sat": "Сб", "Sun": "Вс"}
-
-    def hours_str(day_data: dict) -> str:
-        slots = day_data.get("working_hours") or []
-        return ", ".join(f"{s['from']}–{s['to']}" for s in slots)
-
-    # is_24x7 и подобные флаги — не дни недели, пропускаем нединарные значения
-    intervals = {
-        day: hours_str(data)
-        for day, data in schedule.items()
-        if isinstance(data, dict)
-    }
-
-    unique = set(intervals.values())
-    if len(unique) == 1 and len(intervals) == 7:
-        return f"Пн-Вс: {unique.pop()}"
-
-    # Группируем дни с одинаковым расписанием
-    groups: dict[str, list[str]] = {}
-    for eng_day in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]:
-        if eng_day in intervals:
-            slot = intervals[eng_day]
-            groups.setdefault(slot, []).append(day_map[eng_day])
-
-    parts = [f"{', '.join(days)}: {slot}" for slot, days in groups.items()]
-    return " | ".join(parts)
-
-
 def _extract_for_trucks(raw: dict) -> Tristate:
-    """
-    for_trucks присутствует только в items/byid.
-    API возвращает булево значение.
-    """
+    """Поле for_trucks — только items/byid, значение bool."""
     val = raw.get("for_trucks")
     if val is None:
         return Tristate.UNKNOWN
@@ -217,65 +192,49 @@ def _extract_for_trucks(raw: dict) -> Tristate:
 
 def _extract_disabled_parking(raw: dict) -> Tristate:
     """
-    В items/byid ищем в attribute_groups атрибут с текстом про инвалидов.
-    В clustered эта информация не приходит.
+    Источник 1: capacity.special_spaces[type == "handicapped"].count > 0
+    Источник 2: attribute_groups (тег с "handicapped" / "инвалид")
+    В clustered — всегда UNKNOWN (данных нет).
     """
-    return _search_attribute_groups(
-        raw,
-        keywords=["инвалид", "колясочник", "маломобил"],
-    )
+    capacity_raw = raw.get("capacity")
+    if isinstance(capacity_raw, dict):
+        for space in capacity_raw.get("special_spaces") or []:
+            if space.get("type") == "handicapped":
+                return Tristate.YES if (space.get("count") or 0) > 0 else Tristate.NO
+
+    # Fallback через attribute_groups
+    groups = raw.get("attribute_groups")
+    if not groups:
+        return Tristate.UNKNOWN
+    for group in groups:
+        for attr in group.get("attributes") or []:
+            name = (attr.get("name") or "").lower()
+            tag = (attr.get("tag") or "").lower()
+            if any(kw in name or kw in tag for kw in ["инвалид", "handicap", "маломобил"]):
+                return Tristate.YES
+    return Tristate.NO
 
 
 def _extract_ev_charging(raw: dict) -> Tristate:
     """
-    В items/byid ищем атрибут про зарядку для электромобилей.
-    В clustered эта информация не приходит.
+    Ищем теги parking_ev / parking_ev_charging или слова «зарядка»/«электро».
+    Данных почти никогда нет — UNKNOWN штатный результат.
     """
-    return _search_attribute_groups(
-        raw,
-        keywords=["электро", "зарядк", "ev ", "ev-"],
-    )
+    ev_attr = get_attribute_by_tag(raw, "parking_ev") or get_attribute_by_tag(raw, "parking_ev_charging")
+    if ev_attr is not None:
+        return Tristate.YES
 
+    groups = raw.get("attribute_groups")
+    if not groups:
+        return Tristate.UNKNOWN
+    for group in groups:
+        for attr in group.get("attributes") or []:
+            name = (attr.get("name") or "").lower()
+            tag = (attr.get("tag") or "").lower()
+            if any(kw in name or kw in tag for kw in ["электро", "зарядк", "ev_", "ev-", "parking_ev"]):
+                return Tristate.YES
+    return Tristate.NO
 
-def _extract_type_and_target(raw: dict) -> tuple[Optional[str], Optional[str]]:
-    """
-    Тип и целевой объект выводим из названия парковки эвристически,
-    потому что API не возвращает явного поля "тип парковки".
-
-    Паттерны (порядок важен — от специфичных к общим):
-        ТРК / ТРЦ / ТД / Mall / Mega → ТЦ
-        БЦ / бизнес-центр            → БЦ
-        ЖК / жилой комплекс          → ЖК
-        автостоянка / стоянка        → городская
-        по умолчанию                 → неизвестно
-
-    target_object — часть имени после ключевого слова (например "ТРК АДК" → "АДК").
-    """
-    name = (raw.get("name") or "").strip()
-    name_lower = name.lower()
-
-    # Паттерны: (ключевые слова в имени, тип парковки, regex для извлечения объекта)
-    rules = [
-        (r"\bтр[кц]\b|\bтд\b|\bmall\b|\bmega\b",       "ТЦ",          r"(?:ТРК|ТРЦ|ТД|Mall|Mega)\s+(.+)"),
-        (r"\bбц\b|\bбизнес.центр\b",                    "БЦ",          r"(?:БЦ)\s+(.+)"),
-        (r"\bжк\b|\bжилой\s+комплекс\b",                "ЖК",          r"(?:ЖК)\s+(.+)"),
-        (r"автостоянк|стоянк",                          "городская",   None),
-        (r"parking|паркинг",                            "паркинг",     None),
-    ]
-
-    for pattern, ptype, target_pattern in rules:
-        if re.search(pattern, name_lower):
-            target = None
-            if target_pattern:
-                m = re.search(target_pattern, name, re.IGNORECASE)
-                if m:
-                    target = m.group(1).strip(" ,–-")
-            return ptype, target
-
-    return "неизвестно", None
-
-
-# ── Вспомогательная функция для attribute_groups ──────────────────────────────
 
 def _extract_rating(raw: dict) -> Optional[float]:
     reviews = raw.get("reviews") or {}
@@ -289,23 +248,63 @@ def _extract_reviews_count(raw: dict) -> Optional[int]:
     return int(val) if val is not None else None
 
 
-def _search_attribute_groups(raw: dict, *, keywords: list[str]) -> Tristate:
+def _extract_type_and_target(raw: dict) -> tuple[Optional[str], Optional[str]]:
     """
-    Проходит по attribute_groups и ищет атрибуты по ключевым словам.
-    Если ни одной группы нет — UNKNOWN; если нашли — YES.
+    Тип и целевой объект — ЭВРИСТИКА, штатный результат ("неизвестно", None).
 
-    Возвращает NO только если явно указано обратное
-    (2ГИС не предоставляет явного "нет" — только наличие фичи).
+    Порядок источников:
+    1. purpose_name — явное поле от 2ГИС (редко приходит для парковок)
+    2. group[].type == "building" с именем — наиболее точно
+    3. Паттерны в названии объекта
     """
-    groups = raw.get("attribute_groups")
-    if not groups:
-        return Tristate.UNKNOWN
+    # 1. purpose_name (только items/byid, обычно None для парковок)
+    purpose = (raw.get("purpose_name") or "").strip()
+    if purpose:
+        return purpose, None
 
-    for group in groups:
-        for attr in group.get("attributes") or []:
-            attr_name = (attr.get("name") or "").lower()
-            if any(kw in attr_name for kw in keywords):
-                return Tristate.YES
+    # 2. group с типом building даёт имя здания — это и есть target_object
+    for g in raw.get("group") or []:
+        if g.get("type") == "building" and g.get("name"):
+            building_name = g["name"]
+            ptype = _type_from_name(building_name) or "неизвестно"
+            return ptype, building_name
 
-    # Группы есть, но нужного атрибута нет — скорее всего нет фичи
-    return Tristate.NO
+    # 3. Эвристика по названию парковки
+    name = (raw.get("name") or "").strip()
+    ptype = _type_from_name(name)
+    target = _target_from_name(name) if ptype not in (None, "городская", "паркинг") else None
+
+    return ptype or "неизвестно", target
+
+
+def _type_from_name(name: str) -> Optional[str]:
+    """
+    Определяет тип по ключевым словам в строке.
+    Возвращает None если ничего не подошло — caller решает что делать дальше.
+    """
+    n = name.lower()
+    if re.search(r"\bтр[кц]\b|\bтд\b|\bmall\b|\bmega\b|\bплаза\b|\baport\b", n):
+        return "ТЦ"
+    if re.search(r"\bбц\b|\bбизнес.центр\b|\boffice\b", n):
+        return "БЦ"
+    if re.search(r"\bжк\b|\bжилой\s+комплекс\b|\bresidential\b", n):
+        return "ЖК"
+    if re.search(r"автостоянк|стоянк", n):
+        return "городская"
+    if re.search(r"parking|паркинг", n):
+        return "паркинг"
+    return None
+
+
+def _target_from_name(name: str) -> Optional[str]:
+    """
+    Из "Парковка ТРК АДК" → "ТРК АДК".
+    Срезает префиксные слова "парковка", "стоянка", "паркинг" и возвращает остаток.
+    """
+    cleaned = re.sub(
+        r"^(парковка|автостоянка|стоянка|паркинг|parking)[,\s]+",
+        "",
+        name.strip(),
+        flags=re.IGNORECASE,
+    ).strip(" ,–-")
+    return cleaned if cleaned and cleaned.lower() != name.lower() else None
