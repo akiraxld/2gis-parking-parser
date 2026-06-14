@@ -9,22 +9,42 @@ from typing import Optional
 
 def parse_price_from_text(text: str) -> Optional[float]:
     """
-    Извлекает первое число из строки тарифа.
+    Извлекает ЦЕНУ (не единицы времени) из строки тарифа.
 
-    "400 тнг./час"   → 400.0
-    "1 500 тнг./час" → 1500.0  (пробел как разделитель тысяч)
-    "бесплатно"      → None
+    Стратегия: ищем число перед валютой (тнг/тг/тенге).
+    Это защищает от "1 час - 400 тнг" → не хватаем "1".
+
+    "400 тнг./час"       → 400.0
+    "1 500 тнг./час"     → 1500.0
+    "1 час - 400 тнг"    → 400.0  (берём число перед тнг, не "1")
+    "бесплатно"          → None
     """
-    # Убираем неразрывный пробел, который 2ГИС использует как разделитель тысяч
     cleaned = text.replace("\xa0", " ")
-    m = re.search(r"(\d[\d\s]*)", cleaned)
-    if not m:
-        return None
-    digits = m.group(1).replace(" ", "")
-    try:
-        return float(digits)
-    except ValueError:
-        return None
+
+    # Ищем число непосредственно перед валютой: "400 тнг", "1 500тнг"
+    m = re.search(r"([\d][\d\s]{0,6})\s*(?:тнг|тг|тенге)", cleaned, re.IGNORECASE)
+    if m:
+        digits = m.group(1).replace(" ", "")
+        try:
+            val = float(digits)
+            # Защита от "1 тнг" — скорее всего это единица времени "1 час"
+            if val >= 10:
+                return val
+        except ValueError:
+            pass
+
+    # Fallback: ищем число после слова "час" или после тире/двоеточия
+    m = re.search(r"(?:час|:|-)\s*([\d][\d\s]{0,6})", cleaned, re.IGNORECASE)
+    if m:
+        digits = m.group(1).replace(" ", "")
+        try:
+            val = float(digits)
+            if val >= 10:
+                return val
+        except ValueError:
+            pass
+
+    return None
 
 
 def format_schedule(schedule: dict) -> Optional[str]:

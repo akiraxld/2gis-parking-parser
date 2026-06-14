@@ -114,19 +114,24 @@ def _extract_tariff(raw: dict, *, source: str) -> dict:
 
     1. attribute_groups, тег parking_price_comment — готовый текст тарифа (items/byid)
     2. context.stop_factors — теги parking_cost_parking_hour / parking_cost_parking_day
-       (есть и в clustered, и в items)
     3. raw["is_paid"] — прямой bool-флаг (только items/byid)
 
-    price_per_hour — эвристика: None ожидаем если тарифа нет или он не числовой.
+    Ловушки:
+    - parking_free_parking НЕ означает полностью бесплатную парковку:
+      "первый час бесплатно, затем 200 тг" — текст тега содержит цену → платная.
+    - "заезд 200 тг, парковка бесплатно" — entry fee → платная.
+    - Если raw_tariff содержит число и parking_cost_parking_hour отсутствует —
+      пробуем извлечь price_per_hour из текста тарифа.
     """
     result: dict = {"is_paid": None, "price_per_hour": None, "raw_tariff": None}
 
     # 1. Готовый текст тарифа из attribute_groups
     tariff_comment = get_attribute_by_tag(raw, "parking_price_comment")
 
-    # 2. stop_factors — работают для обоих форматов
+    # 2. stop_factors
     stop_factors = (raw.get("context") or {}).get("stop_factors") or []
     sf_parts: list[str] = []
+    has_free_tag = False
 
     for sf in stop_factors:
         tag = sf.get("tag", "")
@@ -135,18 +140,19 @@ def _extract_tariff(raw: dict, *, source: str) -> dict:
         if tag == "parking_cost_parking_hour":
             sf_parts.append(name)
             result["is_paid"] = True
-            # price_per_hour — эвристика; None если число не найдено
             result["price_per_hour"] = parse_price_from_text(name)
 
         elif tag == "parking_cost_parking_day":
+            # Суточную цену не используем как замену часовой — это разные величины.
+            # Она войдёт в raw_tariff через sf_parts.
             sf_parts.append(name)
 
         elif tag == "parking_free_parking":
+            # "бесплатно 30 мин", "бесплатно первые 15 минут" — бесплатный период,
+            # всегда идёт вместе с parking_cost_parking_hour. is_paid ставим False
+            # только если часовой цены НЕТ (значит парковка действительно бесплатная).
             sf_parts.append(name)
-            # Бесплатный период ≠ полностью бесплатная парковка,
-            # но если hour-цены нет — считаем бесплатной
-            if result["is_paid"] is None:
-                result["is_paid"] = False
+            has_free_tag = True
 
     # raw_tariff: приоритет у явного комментария из attribute_groups
     if tariff_comment:
@@ -154,11 +160,27 @@ def _extract_tariff(raw: dict, *, source: str) -> dict:
     elif sf_parts:
         result["raw_tariff"] = " | ".join(sf_parts)
 
+    # parking_free_parking без часовой цены = бесплатная парковка
+    if has_free_tag and result["is_paid"] is None:
+        result["is_paid"] = False
+
     # 3. Прямой флаг из items/byid (не перезаписываем если уже определили)
     if result["is_paid"] is None and source in ("items", "byid"):
         is_paid_raw = raw.get("is_paid")
         if is_paid_raw is not None:
             result["is_paid"] = bool(is_paid_raw)
+
+    # Если цена за час не найдена в теге, но есть в тексте тарифа (parking_price_comment)
+    if result["price_per_hour"] is None and tariff_comment:
+        result["price_per_hour"] = parse_price_from_text(tariff_comment)
+
+    # Финальная проверка: если есть числовая цена или тариф содержит число —
+    # парковка не может быть бесплатной независимо от тегов
+    if result["is_paid"] is False:
+        has_price = result["price_per_hour"] is not None
+        tariff_has_number = bool(result["raw_tariff"] and re.search(r"\d+", result["raw_tariff"]))
+        if has_price or tariff_has_number:
+            result["is_paid"] = True
 
     return result
 
@@ -175,7 +197,12 @@ def _extract_capacity(raw: dict) -> Optional[int]:
         return None
     if isinstance(val, dict):
         total = val.get("total")
-        return int(total) if total is not None else None
+        if total is None:
+            return None
+        try:
+            return int(total)
+        except (ValueError, TypeError):
+            return None
     try:
         return int(val)
     except (ValueError, TypeError):
@@ -200,7 +227,11 @@ def _extract_disabled_parking(raw: dict) -> Tristate:
     if isinstance(capacity_raw, dict):
         for space in capacity_raw.get("special_spaces") or []:
             if space.get("type") == "handicapped":
-                return Tristate.YES if (space.get("count") or 0) > 0 else Tristate.NO
+                try:
+                    count = int(space.get("count") or 0)
+                except (ValueError, TypeError):
+                    count = 0
+                return Tristate.YES if count > 0 else Tristate.NO
 
     # Fallback через attribute_groups
     groups = raw.get("attribute_groups")
@@ -257,9 +288,11 @@ def _extract_type_and_target(raw: dict) -> tuple[Optional[str], Optional[str]]:
     2. group[].type == "building" с именем — наиболее точно
     3. Паттерны в названии объекта
     """
-    # 1. purpose_name (только items/byid, обычно None для парковок)
+    # 1. purpose_name — только если это не мусорное значение
     purpose = (raw.get("purpose_name") or "").strip()
-    if purpose:
+    # "Объект" — дефолтное значение 2ГИС, не несёт информации
+    USELESS_PURPOSES = {"объект", "организация", "место", "здание", ""}
+    if purpose and purpose.lower() not in USELESS_PURPOSES:
         return purpose, None
 
     # 2. group с типом building даёт имя здания — это и есть target_object
@@ -271,8 +304,16 @@ def _extract_type_and_target(raw: dict) -> tuple[Optional[str], Optional[str]]:
 
     # 3. Эвристика по названию парковки
     name = (raw.get("name") or "").strip()
-    ptype = _type_from_name(name)
-    target = _target_from_name(name) if ptype not in (None, "городская", "паркинг") else None
+
+    # target всегда пробуем — срезаем "Парковка" и смотрим что осталось
+    target = _target_from_name(name)
+
+    # Тип ищем сначала в полном имени, потом в target (там уже без "Парковка")
+    ptype = _type_from_name(name) or (target and _type_from_name(target)) or None
+
+    # Для чисто городских/паркинговых названий без объекта target не нужен
+    if ptype in ("городская", "паркинг") and not target:
+        pass  # target уже None
 
     return ptype or "неизвестно", target
 
@@ -283,28 +324,88 @@ def _type_from_name(name: str) -> Optional[str]:
     Возвращает None если ничего не подошло — caller решает что делать дальше.
     """
     n = name.lower()
-    if re.search(r"\bтр[кц]\b|\bтд\b|\bmall\b|\bmega\b|\bплаза\b|\baport\b", n):
+    # ТЦ / ТРЦ / ТРК / ТД / ТК / МФЦ / МФК / Молл
+    if re.search(
+        r"\bтр[кц]\b|\bтц\b|\bтд\b|\bтк\b|\bмфц\b|\bмфк\b"
+        r"|\bmall\b|\bmega\b|\bплаза\b|\baport\b|\bмолл\b|\bмаркет\b",
+        n,
+    ):
         return "ТЦ"
-    if re.search(r"\bбц\b|\bбизнес.центр\b|\boffice\b", n):
+    # Бизнес-центр
+    if re.search(r"\bбц\b|\bбизнес[\s-]?центр\b|\boffice\b|\bbusiness\b|\bбц\b", n):
         return "БЦ"
+    # Жилой комплекс
     if re.search(r"\bжк\b|\bжилой\s+комплекс\b|\bresidential\b", n):
         return "ЖК"
+    # Гостиница / отель
+    if re.search(r"\bотель\b|\bгостиниц|\bhotel\b|\bрезиденц|\binn\b", n):
+        return "отель"
+    # Аэропорт / вокзал
+    if re.search(r"\bаэропорт|\bвокзал\b|\bairport\b", n):
+        return "транспортный узел"
+    # Городская стоянка
     if re.search(r"автостоянк|стоянк", n):
         return "городская"
-    if re.search(r"parking|паркинг", n):
+    # Городские парковочные сети
+    if re.search(r"\balmaty\s*parking\b", n):
+        return "городская"
+    # Паркинг / parking (как бренд или нейтральное слово)
+    if re.search(r"\bparking\b|\bпаркинг\b|\bparqour\b", n):
         return "паркинг"
     return None
 
 
+# Служебные слова которые срезаем с обоих концов названия
+_PARKING_WORDS = r"парковк[аи]|автостоянк[аи]|стоянк[аи]|паркинг|parking"
+
+
 def _target_from_name(name: str) -> Optional[str]:
     """
-    Из "Парковка ТРК АДК" → "ТРК АДК".
-    Срезает префиксные слова "парковка", "стоянка", "паркинг" и возвращает остаток.
+    Срезает парковочный префикс/суффикс и возвращает целевой объект.
+
+    "Парковка ТД Nur"    → "ТД Nur"
+    "Parqour, парковка"  → "Parqour"
+    "Паркинг БЦ Forte"   → "БЦ Forte"
+    "Almaty Parking, 5"  → "Almaty"  (номер отфильтруется)
+    "Платная парковка"   → None
+    "Автостоянка №5"     → None
     """
+    s = name.strip()
+
+    # Срезаем PREFIX: "Парковка ТД Nur" → "ТД Nur"
     cleaned = re.sub(
-        r"^(парковка|автостоянка|стоянка|паркинг|parking)[,\s]+",
+        rf"^({_PARKING_WORDS})\s*[№#\d]*[,.\s]*",
         "",
-        name.strip(),
+        s,
         flags=re.IGNORECASE,
-    ).strip(" ,–-")
-    return cleaned if cleaned and cleaned.lower() != name.lower() else None
+    ).strip(" ,–-№#")
+
+    # Срезаем SUFFIX если префикс не помог: "Parqour, парковка" → "Parqour"
+    if not cleaned or cleaned.lower() == s.lower():
+        cleaned = re.sub(
+            rf"[,.\s]*({_PARKING_WORDS})\s*[№#\d]*$",
+            "",
+            s,
+            flags=re.IGNORECASE,
+        ).strip(" ,–-№#")
+
+    # Ничего не осталось или то же самое — объект не выделить
+    if not cleaned or cleaned.lower() == s.lower():
+        return None
+
+    # Только цифры/номера — не информативно
+    if re.fullmatch(r"[\d\s№#.,–-]+", cleaned):
+        return None
+
+    # Прилагательные-описатели без конкретного объекта
+    _ADJECTIVES = {
+        "платная", "бесплатная", "платный", "бесплатный",
+        "крытая", "крытый", "подземная", "подземный",
+        "наземная", "наземный", "открытая", "открытый",
+        "охраняемая", "охраняемый", "временная", "временный",
+        "многоуровневая", "многоуровневый",
+    }
+    if cleaned.lower() in _ADJECTIVES:
+        return None
+
+    return cleaned

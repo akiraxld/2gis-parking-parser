@@ -1,0 +1,41 @@
+# --- Секреты и конфигурация ---
+.env
+.env.local
+.env.*.local
+
+# --- Базы данных и тяжелые файлы данных ---
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+*.xlsx
+
+# --- Кэш Python и окружение ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Логи и отчеты ---
+*.log
+logs/
+.pytest_cache/
+
+# --- Настройки IDE (VS Code, PyCharm) ---
+.vscode/
+.idea/
+
+# --- Специфичное для Playwright ---
+test-results/
+playwright-report/
+blob-report/
+playwright/.local-browsers/
+
+# --- Ключи Google ---
+service_account.json
