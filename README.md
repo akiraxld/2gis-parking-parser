@@ -83,7 +83,7 @@ playwright install chromium
 DGIS_API_KEY=ваш_ключ_с_developer.2gis.ru
 ```
 
-Бесплатный ключ: [developer.2gis.ru](https://developer.2gis.ru) → создать проект → API Keys.
+Бесплатный ключ: [developer.2gis.ru]([https://developer.2gis.ru](https://dev.2gis.ru/api?ysclid=mqdhn0dro7442856491)) → получить демо-ключ → регистрация → API Keys.
 
 **3. Настроить Google Sheets**
 
