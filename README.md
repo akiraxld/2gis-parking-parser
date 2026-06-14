@@ -85,12 +85,18 @@ DGIS_API_KEY=ваш_ключ_с_developer.2gis.ru
 
 Бесплатный ключ: [developer.2gis.ru](https://developer.2gis.ru) → создать проект → API Keys.
 
-**3. Настроить Google Sheets** (для выгрузки)
+**3. Настроить Google Sheets**
 
-- Создать проект в [Google Cloud Console](https://console.cloud.google.com)
-- Включить Google Sheets API и Google Drive API
-- Создать сервисный аккаунт → скачать JSON → сохранить как `service_account.json`
-- Поделиться таблицей с email сервисного аккаунта (права редактора)
+3.1. Зайди на https://console.cloud.google.com и создай новый проект  
+3.2. В поиске найди "Google Sheets API" → включи  
+3.3. В поиске найди "Google Drive API" → включи  
+3.4. Слева: IAM и администрирование → Сервисные аккаунты → Создать  
+3.5. Дай любое имя → Готово (роль не нужна)  
+3.6. Кликни на созданный аккаунт → Ключи → Добавить ключ → JSON → скачай  
+3.7. Переименуй скачанный файл в `service_account.json` и положи в папку проекта  
+3.8. Скопируй email аккаунта (вида `name@project.iam.gserviceaccount.com`)  
+3.9. Открой свою Google таблицу → Поделиться → вставь email → Редактор  
+3.10. Вставь ID таблицы в `export.py` (строка `SPREADSHEET_ID = "..."`)
 
 **4. Запустить сбор**
 
