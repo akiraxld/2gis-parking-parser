@@ -6,6 +6,53 @@
 
 ---
 
+## Быстрый старт
+
+**1. Клонировать и установить зависимости**
+
+```bash
+git clone https://github.com/akiraxld/2gis-parking-parser.git
+cd 2gis-parking-parser
+pip install -r requirements.txt
+playwright install chromium
+```
+
+**2. Создать `.env` файл**
+
+```bash
+# .env
+DGIS_API_KEY=ваш_ключ_с_developer.2gis.ru
+```
+
+Бесплатный ключ: [developer.2gis.ru]([https://developer.2gis.ru](https://dev.2gis.ru/api?ysclid=mqdhn0dro7442856491)) → получить демо-ключ → регистрация → API Keys.
+
+**3. Настроить Google Sheets**
+
+3.1. Зайди на https://console.cloud.google.com и создай новый проект  
+3.2. В поиске найди "Google Sheets API" → включи  
+3.3. В поиске найди "Google Drive API" → включи  
+3.4. Слева: IAM и администрирование → Сервисные аккаунты → Создать  
+3.5. Дай любое имя → Готово (роль не нужна)  
+3.6. Кликни на созданный аккаунт → Ключи → Добавить ключ → JSON → скачай  
+3.7. Переименуй скачанный файл в `service_account.json` и положи в папку проекта  
+3.8. Скопируй email аккаунта (вида `name@project.iam.gserviceaccount.com`)  
+3.9. Открой свою Google таблицу → Поделиться → вставь email → Редактор  
+3.10. Вставь ID таблицы в `export.py` (строка `SPREADSHEET_ID = "..."`)
+
+**4. Запустить сбор**
+
+```bash
+# Полный сбор: Playwright → SQLite → обогащение через API
+python collector.py
+
+# Только обогащение (если ID уже собраны)
+python collector.py --enrich-only
+
+# Выгрузка в Google Sheets
+python export.py
+```
+---
+
 ## Что собирает
 
 956 уникальных парковок Алматы со следующими полями:
@@ -65,51 +112,6 @@ samples/              — примеры сырых JSON-ответов от 2Г
 
 ---
 
-## Быстрый старт
-
-**1. Клонировать и установить зависимости**
-
-```bash
-git clone https://github.com/akiraxld/2gis-parking-parser.git
-cd 2gis-parking-parser
-pip install -r requirements.txt
-playwright install chromium
-```
-
-**2. Создать `.env` файл**
-
-```bash
-# .env
-DGIS_API_KEY=ваш_ключ_с_developer.2gis.ru
-```
-
-Бесплатный ключ: [developer.2gis.ru]([https://developer.2gis.ru](https://dev.2gis.ru/api?ysclid=mqdhn0dro7442856491)) → получить демо-ключ → регистрация → API Keys.
-
-**3. Настроить Google Sheets**
-
-3.1. Зайди на https://console.cloud.google.com и создай новый проект  
-3.2. В поиске найди "Google Sheets API" → включи  
-3.3. В поиске найди "Google Drive API" → включи  
-3.4. Слева: IAM и администрирование → Сервисные аккаунты → Создать  
-3.5. Дай любое имя → Готово (роль не нужна)  
-3.6. Кликни на созданный аккаунт → Ключи → Добавить ключ → JSON → скачай  
-3.7. Переименуй скачанный файл в `service_account.json` и положи в папку проекта  
-3.8. Скопируй email аккаунта (вида `name@project.iam.gserviceaccount.com`)  
-3.9. Открой свою Google таблицу → Поделиться → вставь email → Редактор  
-3.10. Вставь ID таблицы в `export.py` (строка `SPREADSHEET_ID = "..."`)
-
-**4. Запустить сбор**
-
-```bash
-# Полный сбор: Playwright → SQLite → обогащение через API
-python collector.py
-
-# Только обогащение (если ID уже собраны)
-python collector.py --enrich-only
-
-# Выгрузка в Google Sheets
-python export.py
-```
 
 ---
 
